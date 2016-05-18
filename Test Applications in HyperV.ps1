@@ -16,7 +16,7 @@ This needs to be run on the computer running Hyper-V!
 
 $ScriptName = $MyInvocation.MyCommand.path
 $Directory = Split-Path $ScriptName
-$Popup = new-object -comobject wscript.shell
+$Popup = New-Object -comobject wscript.shell
 $Script:LogFile = "$Directory\ApplicationInstalls.log"
 $Script:SaveCMMLogFiles = $false
 $Script:CreateCheckPointPerApp = $false
@@ -111,29 +111,38 @@ Function Translate-EvaluationState {
     return $strEvaluationState
 }
 
+$secpasswd = ConvertTo-SecureString “P@ssw0rd” -AsPlainText -Force
+$Credential = New-Object System.Management.Automation.PSCredential (“Evil\Administrator”, $secpasswd)
+
 Function LoadApplications {
     Param ($CompName)
     $ApplicationArray = New-Object System.Collections.ArrayList
 	Try {
-		Get-WmiObject -Query "select * from CCM_Application" -Namespace root\ccm\clientsdk -ComputerName $CompName | ForEach-Object {
-			$Results = Select-Object -InputObject "" Name, Installed, Required, LastEvaluated
-			$Results.Name = $_.Name
-			if ($Results.Name -ne $null) {$FoundApps = $true}
-			$Results.Installed = $_.InstallState
-			$ResolvedState = $_.ResolvedState
-			If ($ResolvedState -eq "Available") {$Results.Required = "False"}
-			else {$Results.Required = "True"}
-			$LastEvalTime = $_.LastEvalTime
-			if ($LastEvalTime -ne $null) {
-				$EvalTime = $_.ConvertToDateTime($_.LastEvalTime)
-				$Results.LastEvaluated = $EvalTime.ToShortDateString() + " " + $EvalTime.ToShortTimeString()
-			}
-			$ApplicationArray += $Results
+        #$Credential = Get-Credential
+        $ApplicationObjects = Invoke-Command -Credential $Credential -VMName $CompName -ScriptBlock {
+        #Foreach ($AppObject in $ApplicationObjects) {		
+            Get-WmiObject -Query "select * from CCM_Application" -Namespace root\ccm\clientsdk | ForEach-Object {
+			    $Results = Select-Object -InputObject "" Name, Installed, Required, LastEvaluated
+			    $Results.Name = $_.Name
+			    if ($Results.Name -ne $null) {$FoundApps = $true}
+			    $Results.Installed = $_.InstallState
+			    $ResolvedState = $_.ResolvedState
+			    If ($ResolvedState -eq "Available") {$Results.Required = "False"}
+			    else {$Results.Required = "True"}
+			    $LastEvalTime = $_.LastEvalTime
+			    if ($LastEvalTime -ne $null) {
+				    $EvalTime = $_.ConvertToDateTime($_.LastEvalTime)
+				    $Results.LastEvaluated = $EvalTime.ToShortDateString() + " " + $EvalTime.ToShortTimeString()
+			    }
+                $Results
+            }
 		}
+        #Foreach ( $Obj in $ApplicationObjects )  { $ApplicationArray.Add($Obj);$obj }
+        
+        $ApplicationArray = $ApplicationObjects
         Log -Message "Finished loading application list!" -LogFile $LogFile
 	}
     Catch {Log -Message "Error loading applications -" -ErrorMessage $_.Exception.Message -LogFile $LogFile}
-
     return $ApplicationArray
 }
 
@@ -325,7 +334,7 @@ foreach ($instance in $Script:AppList) {
     Do {
         $Script:VMObject = Get-VM -Name $Script:strVMName
         If ($VMObject.State -eq "Running") {
-            Start-Sleep 10
+            #Start-Sleep 10
             $StopLoop = $true
         }
         else { 
@@ -344,30 +353,41 @@ foreach ($instance in $Script:AppList) {
     $AppRestartCodes = 13,14,9
 
     Try {
-		$WMIPath = "\\" + $Script:strCompName + "\root\ccm\clientsdk:CCM_Application"
-		$WMIClass = [WMIClass] $WMIPath
-        $ApplicationID = ""
-        $ApplicationRevision = ""
-        $IsMachineTarget = ""
-		Get-WmiObject -ComputerName $Script:strCompName -Query "select * from CCM_Application" -Namespace root\ccm\ClientSDK | ForEach-Object {
-			if ($_.Name -eq $instance) {
-				$ApplicationRevision = $_.Revision
-				$IsMachineTarget = $_.IsMachineTarget
-				$EnforcePreference = $_.EnforcePreference
-				$ApplicationID = $_.ID
-			}
-		}
-		$WMIClass.Install($ApplicationID, $ApplicationRevision, $IsMachineTarget, "", "1", $false) | Out-null
+        Invoke-Command -Credential $Credential -VMName $Script:strVMName -ArgumentList $instance -ScriptBlock {
+            $instance = $args[0]
+		    $WMIPath = "root\ccm\clientsdk:CCM_Application"
+		    $WMIClass = [WMIClass] $WMIPath
+            $ApplicationID = ""
+            $ApplicationRevision = ""
+            $IsMachineTarget = ""
+		    Get-WmiObject -Query "select * from CCM_Application" -Namespace root\ccm\ClientSDK | ForEach-Object {
+			    if ($_.Name -eq $instance) {
+				    $ApplicationRevision = $_.Revision
+				    $IsMachineTarget = $_.IsMachineTarget
+				    $EnforcePreference = $_.EnforcePreference
+				    $ApplicationID = $_.ID
+			    }
+		    }
+		    $WMIClass.Install($ApplicationID, $ApplicationRevision, $IsMachineTarget, "", "1", $false) | Out-null
+        }
         
         $EndLoop = $false
         do {
             $InstallState = "NotInstalled"
-		    Get-WmiObject -ComputerName $Script:strCompName -Query "select * from CCM_Application" -Namespace root\ccm\ClientSDK | ForEach-Object {
-			    if ($_.Name -eq $instance) {
-				    $InstallState = $_.InstallState
-                    $EvaluationState = $_.EvaluationState
-			    }
-		    }
+            $ReturnString = Invoke-Command -Credential $Credential -VMName $Script:strVMName -ArgumentList $instance -ScriptBlock {
+		        $ReturnString = ''
+                $instance = $args[0]
+                Get-WmiObject -Query "select * from CCM_Application" -Namespace root\ccm\ClientSDK | ForEach-Object {
+			        if ($_.Name -eq $instance) {
+				        $InstallState = $_.InstallState
+                        $EvaluationState = $_.EvaluationState
+                        $ReturnString = "$InstallState" + ";" + "$EvaluationState"
+			        }
+		        }
+                return $ReturnString
+            }
+            $InstallState = ($ReturnString.Split(';'))[0]
+            $EvaluationState = ($ReturnString.Split(';'))[1]
             $TranslatedEvaluationState = Translate-EvaluationState -EvaluationState $EvaluationState
             If ($InstallState -eq "Installed") {
                 $CopyLogFiles = $Script:SaveLogsSuccessful
@@ -385,37 +405,44 @@ foreach ($instance in $Script:AppList) {
                 }
                 elseif ($AppInProgressCodes -contains $EvaluationState) {
                     Log "$instance - Still in progress. Sleeping 30 seconds. Evaluation State: $TranslatedEvaluationState" -LogFile $LogFile
-                    Start-Sleep 30
+                    Start-Sleep 10
                 }
                 elseif ($AppRestartCodes -contains $EvaluationState) {
                     Log "$instance - Requires restart to complete install. Will restart computer and wait 180 seconds now... Evaluation State: $TranslatedEvaluationState" -LogFile $LogFile
                     try {
-                        shutdown /r /t 0 /m "\\$Script:strCompName"
+                        Invoke-Command -Credential $Credential -VMName $Script:strVMName -ScriptBlock {
+                            shutdown /r /t 0
+                        }
                         Start-Sleep 180
                     }
                     catch { Log "$instance - Error restarting computer!" -ErrorMessage $_.Exception.Message -LogFile $LogFile }
                     try {
                         Log "$instance - Starting CCMExec service so the Application install can restart" -LogFile $LogFile
-                        (Get-WmiObject -ComputerName $Script:strCompName -Query "Select * From Win32_Service where Name like 'ccmexec'").StartService()
+                        Invoke-Command -Credential $Credential -VMName $Script:strVMName -ScriptBlock {
+                            (Get-WmiObject -Query "Select * From Win32_Service where Name like 'ccmexec'").StartService()
+                        }
                         Start-Sleep 60
                     }
                     catch { Log "$instance - Error starting ccmexec on remote computer" -ErrorMessage $_.Exception.Message -LogFile $LogFile }
                     try {
                         Log "$instance - Triggering application install again to re-check detection method..." -LogFile $LogFile
-                        $WMIPath = "\\" + $Script:strCompName + "\root\ccm\clientsdk:CCM_Application"
-		                $WMIClass = [WMIClass] $WMIPath
-                        $ApplicationID = ""
-                        $ApplicationRevision = ""
-                        $IsMachineTarget = ""
-		                Get-WmiObject -ComputerName $Script:strCompName -Query "select * from CCM_Application" -Namespace root\ccm\ClientSDK | ForEach-Object {
-			                if ($_.Name -eq $instance) {
-				                $ApplicationRevision = $_.Revision
-				                $IsMachineTarget = $_.IsMachineTarget
-				                $EnforcePreference = $_.EnforcePreference
-				                $ApplicationID = $_.ID
-			                }
-		                }
-		                $WMIClass.Install($ApplicationID, $ApplicationRevision, $IsMachineTarget, "", "1", $false) | Out-null
+                        Invoke-Command -Credential $Credential -VMName $Script:strVMName -ArgumentList $instance -ScriptBlock {
+                            $instance = $args[0]
+                            $WMIPath = "root\ccm\clientsdk:CCM_Application"
+		                    $WMIClass = [WMIClass] $WMIPath
+                            $ApplicationID = ""
+                            $ApplicationRevision = ""
+                            $IsMachineTarget = ""
+		                    Get-WmiObject -Query "select * from CCM_Application" -Namespace root\ccm\ClientSDK | ForEach-Object {
+			                    if ($_.Name -eq $instance) {
+				                    $ApplicationRevision = $_.Revision
+				                    $IsMachineTarget = $_.IsMachineTarget
+				                    $EnforcePreference = $_.EnforcePreference
+				                    $ApplicationID = $_.ID
+			                    }
+		                    }
+		                    $WMIClass.Install($ApplicationID, $ApplicationRevision, $IsMachineTarget, "", "1", $false) | Out-null
+                        }
                         Start-Sleep 20
                     }
                     catch { 
